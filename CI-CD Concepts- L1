@@ -1,0 +1,316 @@
+name: CI/CD
+
+# Assumes a Node.js app with a root package.json defining these scripts:
+#   lint, test, test:e2e, build
+# and a Dockerfile at the repo root. Adjust paths/commands to your layout.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same branch/PR to save minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege default; jobs elevate only what they need.
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "20"
+  REGISTRY: ghcr.io
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stages 3-4: Install, lint, build
+  # ---------------------------------------------------------------------------
+  lint-and-build:
+    name: Lint & build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+
+  # ---------------------------------------------------------------------------
+  # Stage 5a: Unit + integration tests (throwaway Postgres service container)
+  # ---------------------------------------------------------------------------
+  test:
+    name: Unit & integration tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: app_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://test:test@localhost:5432/app_test
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+      - run: npm test -- --coverage
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Stage 5b: End-to-end tests (Playwright)
+  # ---------------------------------------------------------------------------
+  e2e:
+    name: E2E tests
+    runs-on: ubuntu-latest
+    needs: [lint-and-build]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: app_e2e
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://test:test@localhost:5432/app_e2e
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+
+      # Expects playwright.config to start the app via its `webServer` option.
+      - run: npm run test:e2e
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Stage 6: Security scanning
+  # ---------------------------------------------------------------------------
+  security:
+    name: Security scans
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # CodeQL uploads results
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Gitleaks scans history
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Dependency audit
+        run: npm audit --audit-level=high
+
+      - name: Secret scan (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+
+      - name: Run CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+
+      - name: Filesystem vulnerability scan (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+  # ---------------------------------------------------------------------------
+  # Stage 7: Package - build once, push an immutable image tagged with the SHA
+  # Runs only on pushes to main, after every check has passed.
+  # ---------------------------------------------------------------------------
+  package:
+    name: Build & push image
+    runs-on: ubuntu-latest
+    needs: [lint-and-build, test, e2e, security]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # GHCR requires lowercase image names.
+      - name: Compute image reference
+        id: ref
+        run: |
+          IMAGE="${REGISTRY}/${GITHUB_REPOSITORY,,}"
+          echo "image=${IMAGE}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "name=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.ref.outputs.image }}
+            ${{ steps.ref.outputs.name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan built image (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.ref.outputs.image }}
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+  # ---------------------------------------------------------------------------
+  # Stages 8-9: Deploy to staging (migrations run as part of the deploy)
+  # ---------------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to staging
+    runs-on: ubuntu-latest
+    needs: [package]
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_URL }}
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      # Replace this step with whatever matches your hosting. Examples:
+      #   Kubernetes:  kubectl set image deployment/web web=$IMAGE
+      #   Render/Fly:  curl -X POST "$DEPLOY_HOOK_URL"
+      #   ECS:         aws-actions/amazon-ecs-deploy-task-definition@v2
+      - name: Run migrations and deploy
+        env:
+          IMAGE: ${{ needs.package.outputs.image }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+        run: |
+          echo "Deploying $IMAGE to staging"
+          ./scripts/deploy.sh staging "$IMAGE"
+
+  # ---------------------------------------------------------------------------
+  # Stage 10: Post-deploy verification
+  # ---------------------------------------------------------------------------
+  verify-staging:
+    name: Smoke tests (staging)
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    steps:
+      - name: Health check
+        run: |
+          curl --fail --silent --show-error \
+            --retry 10 --retry-delay 6 --retry-all-errors \
+            "${{ vars.STAGING_URL }}/health"
+
+      # Optional: run a Playwright smoke suite against the live staging URL.
+      # - uses: actions/checkout@v4
+      # - uses: actions/setup-node@v4
+      #   with: { node-version: "20", cache: npm }
+      # - run: npm ci && npx playwright install --with-deps chromium
+      # - run: npm run test:smoke
+      #   env:
+      #     BASE_URL: ${{ vars.STAGING_URL }}
+
+  # ---------------------------------------------------------------------------
+  # Stage 11: Deploy to production - same image, gated by manual approval.
+  # Configure "Required reviewers" on the `production` environment in
+  # Settings > Environments to enforce the approval step.
+  # ---------------------------------------------------------------------------
+  deploy-production:
+    name: Deploy to production
+    runs-on: ubuntu-latest
+    needs: [package, verify-staging]
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_URL }}
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run migrations and deploy
+        env:
+          IMAGE: ${{ needs.package.outputs.image }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+        run: |
+          echo "Deploying $IMAGE to production"
+          ./scripts/deploy.sh production "$IMAGE"
+
+      - name: Production health check
+        run: |
+          curl --fail --silent --show-error \
+            --retry 10 --retry-delay 6 --retry-all-errors \
+            "${{ vars.PRODUCTION_URL }}/health"
+
+      # Stage 12: notify on failure (swap for Slack/PagerDuty as needed).
+      - name: Flag failed deploy
+        if: failure()
+        run: echo "::error::Production deploy failed. Roll back to the previous image tag."
